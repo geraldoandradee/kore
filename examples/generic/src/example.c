@@ -17,15 +17,17 @@
 #include <kore/kore.h>
 #include <kore/http.h>
 
+#include <openssl/sha.h>
+
+#include <fcntl.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 #include "assets.h"
 
 int		example_load(int);
 
-int		serve_style_css(struct http_request *);
-int		serve_index(struct http_request *);
-int		serve_intro(struct http_request *);
 int		serve_b64test(struct http_request *);
-int		serve_spdyreset(struct http_request *);
 int		serve_file_upload(struct http_request *);
 int		serve_validator(struct http_request *);
 int		serve_params_test(struct http_request *);
@@ -53,6 +55,9 @@ example_load(int state)
 	switch (state) {
 	case KORE_MODULE_LOAD:
 		kore_log(LOG_NOTICE, "module loading");
+
+		/* Set server version */
+		http_server_version("Server/0.1");
 		break;
 	case KORE_MODULE_UNLOAD:
 		kore_log(LOG_NOTICE, "module unloading");
@@ -66,60 +71,14 @@ example_load(int state)
 }
 
 int
-serve_style_css(struct http_request *req)
-{
-	char		*date;
-	time_t		tstamp;
-
-	tstamp = 0;
-	if (http_request_header(req, "if-modified-since", &date)) {
-		tstamp = kore_date_to_time(date);
-		kore_mem_free(date);
-
-		kore_debug("header was present with %ld", tstamp);
-	}
-
-	if (tstamp != 0 && tstamp <= asset_mtime_style_css) {
-		http_response(req, 304, NULL, 0);
-	} else {
-		date = kore_time_to_date(asset_mtime_style_css);
-		if (date != NULL)
-			http_response_header(req, "last-modified", date);
-
-		http_response_header(req, "content-type", "text/css");
-		http_response(req, 200, asset_style_css, asset_len_style_css);
-	}
-
-	return (KORE_RESULT_OK);
-}
-
-int
-serve_index(struct http_request *req)
-{
-	http_response_header(req, "content-type", "text/html");
-	http_response(req, 200, asset_index_html, asset_len_index_html);
-
-	return (KORE_RESULT_OK);
-}
-
-int
-serve_intro(struct http_request *req)
-{
-	http_response_header(req, "content-type", "image/jpg");
-	http_response(req, 200, asset_intro_jpg, asset_len_intro_jpg);
-
-	return (KORE_RESULT_OK);
-}
-
-int
 serve_b64test(struct http_request *req)
 {
 	int			i;
-	u_int32_t		len;
+	size_t			len;
 	struct kore_buf		*res;
 	u_int8_t		*data;
 
-	res = kore_buf_create(1024);
+	res = kore_buf_alloc(1024);
 	for (i = 0; b64tests[i] != NULL; i++)
 		test_base64((u_int8_t *)b64tests[i], strlen(b64tests[i]), res);
 
@@ -127,41 +86,38 @@ serve_b64test(struct http_request *req)
 
 	http_response_header(req, "content-type", "text/plain");
 	http_response(req, 200, data, len);
-	kore_mem_free(data);
+	kore_free(data);
 
-	return (KORE_RESULT_OK);
-}
-
-int
-serve_spdyreset(struct http_request *req)
-{
-	spdy_session_teardown(req->owner, SPDY_SESSION_ERROR_OK);
 	return (KORE_RESULT_OK);
 }
 
 int
 serve_file_upload(struct http_request *req)
 {
-	int			r;
 	u_int8_t		*d;
 	struct kore_buf		*b;
-	u_int32_t		len;
+	struct http_file	*f;
+	size_t			len;
 	char			*name, buf[BUFSIZ];
 
-	b = kore_buf_create(asset_len_upload_html);
+	b = kore_buf_alloc(asset_len_upload_html);
 	kore_buf_append(b, asset_upload_html, asset_len_upload_html);
 
 	if (req->method == HTTP_METHOD_POST) {
-		http_populate_multipart_form(req, &r);
-		if (http_argument_get_string("firstname", &name, &len)) {
-			kore_buf_replace_string(b, "$firstname$", name, len);
+		if (req->http_body_fd != -1)
+			kore_log(LOG_NOTICE, "file is on disk");
+
+		http_populate_multipart_form(req);
+		if (http_argument_get_string(req, "firstname", &name)) {
+			kore_buf_replace_string(b, "$firstname$",
+			    name, strlen(name));
 		} else {
 			kore_buf_replace_string(b, "$firstname$", NULL, 0);
 		}
 
-		if (http_file_lookup(req, "file", &name, &d, &len)) {
+		if ((f = http_file_lookup(req, "file")) != NULL) {
 			(void)snprintf(buf, sizeof(buf),
-			    "%s is %d bytes", name, len);
+			    "%s is %ld bytes", f->filename, f->length);
 			kore_buf_replace_string(b,
 			    "$upload$", buf, strlen(buf));
 		} else {
@@ -176,7 +132,7 @@ serve_file_upload(struct http_request *req)
 
 	http_response_header(req, "content-type", "text/html");
 	http_response(req, 200, d, len);
-	kore_mem_free(d);
+	kore_free(d);
 
 	return (KORE_RESULT_OK);
 }
@@ -185,7 +141,7 @@ void
 test_base64(u_int8_t *src, u_int32_t slen, struct kore_buf *res)
 {
 	char		*in;
-	u_int32_t	len;
+	size_t		len;
 	u_int8_t	*out;
 
 	kore_buf_appendf(res, "test '%s'\n", src);
@@ -201,10 +157,10 @@ test_base64(u_int8_t *src, u_int32_t slen, struct kore_buf *res)
 			kore_buf_appendf(res, "decoded: ");
 			kore_buf_append(res, out, len);
 			kore_buf_appendf(res, "\n");
-			kore_mem_free(out);
+			kore_free(out);
 		}
 
-		kore_mem_free(in);
+		kore_free(in);
 	}
 
 	kore_buf_appendf(res, "\n");
@@ -238,26 +194,29 @@ serve_params_test(struct http_request *req)
 {
 	struct kore_buf		*b;
 	u_int8_t		*d;
-	u_int32_t		len;
+	size_t			len;
 	int			r, i;
 	char			*test, name[10];
 
-	http_populate_arguments(req);
+	if (req->method == HTTP_METHOD_GET)
+		http_populate_get(req);
+	else if (req->method == HTTP_METHOD_POST)
+		http_populate_post(req);
 
-	b = kore_buf_create(asset_len_params_html);
+	b = kore_buf_alloc(asset_len_params_html);
 	kore_buf_append(b, asset_params_html, asset_len_params_html);
 
 	/*
 	 * The GET parameters will be filtered out on POST.
 	 */
-	if (http_argument_get_string("arg1", &test, &len)) {
-		kore_buf_replace_string(b, "$arg1$", test, len);
+	if (http_argument_get_string(req, "arg1", &test)) {
+		kore_buf_replace_string(b, "$arg1$", test, strlen(test));
 	} else {
 		kore_buf_replace_string(b, "$arg1$", NULL, 0);
 	}
 
-	if (http_argument_get_string("arg2", &test, &len)) {
-		kore_buf_replace_string(b, "$arg2$", test, len);
+	if (http_argument_get_string(req, "arg2", &test)) {
+		kore_buf_replace_string(b, "$arg2$", test, strlen(test));
 	} else {
 		kore_buf_replace_string(b, "$arg2$", NULL, 0);
 	}
@@ -267,7 +226,7 @@ serve_params_test(struct http_request *req)
 		kore_buf_replace_string(b, "$test2$", NULL, 0);
 		kore_buf_replace_string(b, "$test3$", NULL, 0);
 
-		if (http_argument_get_uint16("id", &r))
+		if (http_argument_get_uint16(req, "id", &r))
 			kore_log(LOG_NOTICE, "id: %d", r);
 		else
 			kore_log(LOG_NOTICE, "No id set");
@@ -275,16 +234,16 @@ serve_params_test(struct http_request *req)
 		http_response_header(req, "content-type", "text/html");
 		d = kore_buf_release(b, &len);
 		http_response(req, 200, d, len);
-		kore_mem_free(d);
+		kore_free(d);
 
 		return (KORE_RESULT_OK);
 	}
 
 	for (i = 1; i < 4; i++) {
 		(void)snprintf(name, sizeof(name), "test%d", i);
-		if (http_argument_get_string(name, &test, &len)) {
+		if (http_argument_get_string(req, name, &test)) {
 			(void)snprintf(name, sizeof(name), "$test%d$", i);
-			kore_buf_replace_string(b, name, test, len);
+			kore_buf_replace_string(b, name, test, strlen(test));
 		} else {
 			(void)snprintf(name, sizeof(name), "$test%d$", i);
 			kore_buf_replace_string(b, name, NULL, 0);
@@ -294,7 +253,7 @@ serve_params_test(struct http_request *req)
 	http_response_header(req, "content-type", "text/html");
 	d = kore_buf_release(b, &len);
 	http_response(req, 200, d, len);
-	kore_mem_free(d);
+	kore_free(d);
 
 	return (KORE_RESULT_OK);
 }
@@ -305,17 +264,6 @@ serve_private(struct http_request *req)
 	http_response_header(req, "content-type", "text/html");
 	http_response_header(req, "set-cookie", "session_id=test123");
 	http_response(req, 200, asset_private_html, asset_len_private_html);
-
-	return (KORE_RESULT_OK);
-}
-
-int
-serve_private_test(struct http_request *req)
-{
-	http_response_header(req, "content-type", "text/html");
-
-	http_response(req, 200, asset_private_test_html,
-	    asset_len_private_test_html);
 
 	return (KORE_RESULT_OK);
 }

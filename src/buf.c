@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,26 +14,63 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+
 #include "kore.h"
 
 struct kore_buf *
-kore_buf_create(u_int32_t initial)
+kore_buf_alloc(size_t initial)
 {
 	struct kore_buf		*buf;
 
 	buf = kore_malloc(sizeof(*buf));
-	buf->data = kore_malloc(initial);
-	buf->length = initial;
-	buf->offset = 0;
+	kore_buf_init(buf, initial);
+	buf->flags = KORE_BUF_OWNER_API;
 
 	return (buf);
 }
 
 void
-kore_buf_append(struct kore_buf *buf, const void *d, u_int32_t len)
+kore_buf_init(struct kore_buf *buf, size_t initial)
 {
-	if ((buf->offset + len) >= buf->length) {
-		buf->length += len + KORE_BUF_INCREMENT;
+	if (initial > 0)
+		buf->data = kore_malloc(initial);
+	else
+		buf->data = NULL;
+
+	buf->length = initial;
+	buf->offset = 0;
+	buf->flags = 0;
+}
+
+void
+kore_buf_cleanup(struct kore_buf *buf)
+{
+	kore_free(buf->data);
+	buf->data = NULL;
+	buf->offset = 0;
+	buf->length = 0;
+}
+
+void
+kore_buf_free(struct kore_buf *buf)
+{
+	kore_buf_cleanup(buf);
+	if (buf->flags & KORE_BUF_OWNER_API)
+		kore_free(buf);
+}
+
+void
+kore_buf_append(struct kore_buf *buf, const void *d, size_t len)
+{
+	if ((buf->offset + len) < len)
+		fatal("overflow in kore_buf_append");
+
+	if ((buf->offset + len) > buf->length) {
+		buf->length += len;
 		buf->data = kore_realloc(buf->data, buf->length);
 	}
 
@@ -42,37 +79,31 @@ kore_buf_append(struct kore_buf *buf, const void *d, u_int32_t len)
 }
 
 void
-kore_buf_appendb(struct kore_buf *buf, struct kore_buf *src)
-{
-	u_int8_t	*d;
-	u_int32_t	len;
-
-	d = kore_buf_release(src, &len);
-	kore_buf_append(buf, d, len);
-	kore_mem_free(d);
-}
-
-void
 kore_buf_appendv(struct kore_buf *buf, const char *fmt, va_list args)
 {
 	int		l;
+	va_list		copy;
 	char		*b, sb[BUFSIZ];
+
+	va_copy(copy, args);
 
 	l = vsnprintf(sb, sizeof(sb), fmt, args);
 	if (l == -1)
 		fatal("kore_buf_appendv(): vsnprintf error");
 
 	if ((size_t)l >= sizeof(sb)) {
-		l = vasprintf(&b, fmt, args);
+		l = vasprintf(&b, fmt, copy);
 		if (l == -1)
 			fatal("kore_buf_appendv(): error or truncation");
 	} else {
 		b = sb;
 	}
 
-	kore_buf_append(buf, (u_int8_t *)b, l);
+	kore_buf_append(buf, b, l);
 	if (b != sb)
 		free(b);
+
+	va_end(copy);
 }
 
 void
@@ -85,31 +116,39 @@ kore_buf_appendf(struct kore_buf *buf, const char *fmt, ...)
 	va_end(args);
 }
 
+char *
+kore_buf_stringify(struct kore_buf *buf, size_t *len)
+{
+	char		c;
+
+	if (len != NULL)
+		*len = buf->offset;
+
+	c = '\0';
+	kore_buf_append(buf, &c, sizeof(c));
+
+	return ((char *)buf->data);
+}
+
 u_int8_t *
-kore_buf_release(struct kore_buf *buf, u_int32_t *len)
+kore_buf_release(struct kore_buf *buf, size_t *len)
 {
 	u_int8_t	*p;
 
 	p = buf->data;
 	*len = buf->offset;
-	kore_mem_free(buf);
+
+	buf->data = NULL;
+	kore_buf_free(buf);
 
 	return (p);
 }
 
 void
-kore_buf_free(struct kore_buf *buf)
-{
-	kore_mem_free(buf->data);
-	kore_mem_free(buf);
-}
-
-void
 kore_buf_replace_string(struct kore_buf *b, char *src, void *dst, size_t len)
 {
-	u_int32_t	blen, off, off2;
-	size_t		nlen, klen;
 	char		*key, *end, *tmp, *p;
+	size_t		blen, off, off2, nlen, klen;
 
 	off = 0;
 	klen = strlen(src);
@@ -132,11 +171,17 @@ kore_buf_replace_string(struct kore_buf *b, char *src, void *dst, size_t len)
 			memcpy((tmp + off), dst, len);
 		memcpy((tmp + off + len), end, off2);
 
-		kore_mem_free(b->data);
+		kore_free(b->data);
 		b->data = (u_int8_t *)tmp;
 		b->offset = off + len + off2;
 		b->length = nlen;
 
 		off = off + len;
 	}
+}
+
+void
+kore_buf_reset(struct kore_buf *buf)
+{
+	buf->offset = 0;
 }

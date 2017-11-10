@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -21,13 +21,20 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 
+#if !defined(KORE_NO_TLS)
+#include <openssl/rand.h>
+#endif
+
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <signal.h>
 
 #include "kore.h"
+
+#if !defined(KORE_NO_HTTP)
 #include "http.h"
+#endif
 
 #if defined(KORE_USE_PGSQL)
 #include "pgsql.h"
@@ -37,13 +44,20 @@
 #include "tasks.h"
 #endif
 
+#if defined(KORE_USE_PYTHON)
+#include "python_api.h"
+#endif
+
 #if defined(WORKER_DEBUG)
 #define worker_debug(fmt, ...)		printf(fmt, ##__VA_ARGS__)
 #else
 #define worker_debug(fmt, ...)
 #endif
 
-#define KORE_SHM_KEY		15000
+#if !defined(WAIT_ANY)
+#define WAIT_ANY		(-1)
+#endif
+
 #define WORKER_LOCK_TIMEOUT	500
 
 #define WORKER(id)						\
@@ -61,7 +75,12 @@ static void	worker_unlock(void);
 static inline int	kore_worker_acceptlock_obtain(void);
 static inline void	kore_worker_acceptlock_release(void);
 
+#if !defined(KORE_NO_TLS)
+static void		worker_entropy_recv(struct kore_msg *, const void *);
+#endif
+
 static struct kore_worker		*kore_workers;
+static int				worker_no_lock;
 static int				shm_accept_key;
 static struct wlock			*accept_lock;
 
@@ -79,8 +98,15 @@ kore_worker_init(void)
 	size_t			len;
 	u_int16_t		i, cpu;
 
+	worker_no_lock = 0;
+
 	if (worker_count == 0)
 		worker_count = 1;
+
+#if !defined(KORE_NO_TLS)
+	/* account for the key manager. */
+	worker_count += 1;
+#endif
 
 	len = sizeof(*accept_lock) +
 	    (sizeof(struct kore_worker) * worker_count);
@@ -102,7 +128,7 @@ kore_worker_init(void)
 	kore_debug("kore_worker_init(): starting %d workers", worker_count);
 
 	if (worker_count > cpu_count) {
-		kore_debug("kore_worker_init(): more workers then cpu's");
+		kore_debug("kore_worker_init(): more workers than cpu's");
 	}
 
 	cpu = 0;
@@ -193,16 +219,11 @@ kore_worker_dispatch_signal(int sig)
 }
 
 void
-kore_worker_entry(struct kore_worker *kw)
+kore_worker_privdrop(void)
 {
-	size_t			fd;
+	rlim_t			fd;
 	struct rlimit		rl;
-	char			buf[16];
-	int			quit, had_lock, r;
-	u_int64_t		now, idle_check, next_lock, netwait;
 	struct passwd		*pw = NULL;
-
-	worker = kw;
 
 	/* Must happen before chroot. */
 	if (skip_runas == 0) {
@@ -251,8 +272,26 @@ kore_worker_entry(struct kore_worker *kw)
 #endif
 			fatal("cannot drop privileges");
 	}
+}
+
+void
+kore_worker_entry(struct kore_worker *kw)
+{
+	struct kore_runtime_call	*rcall;
+	char				buf[16];
+	int				quit, had_lock, r;
+	u_int64_t			now, next_lock, netwait;
+#if !defined(KORE_NO_TLS)
+	u_int64_t			last_seed;
+#endif
+
+	worker = kw;
 
 	(void)snprintf(buf, sizeof(buf), "kore [wrk %d]", kw->id);
+#if !defined(KORE_NO_TLS)
+	if (kw->id == KORE_WORKER_KEYMGR)
+		(void)snprintf(buf, sizeof(buf), "kore [keymgr]");
+#endif
 	kore_platform_proctitle(buf);
 
 	if (worker_set_affinity == 1)
@@ -263,6 +302,7 @@ kore_worker_entry(struct kore_worker *kw)
 	sig_recv = 0;
 	signal(SIGHUP, kore_signal);
 	signal(SIGQUIT, kore_signal);
+	signal(SIGTERM, kore_signal);
 	signal(SIGPIPE, SIG_IGN);
 
 	if (foreground)
@@ -270,43 +310,89 @@ kore_worker_entry(struct kore_worker *kw)
 	else
 		signal(SIGINT, SIG_IGN);
 
+#if !defined(KORE_NO_TLS)
+	if (kw->id == KORE_WORKER_KEYMGR) {
+		kore_keymgr_run();
+		exit(0);
+	}
+#endif
+
+	kore_worker_privdrop();
+
 	net_init();
+#if !defined(KORE_NO_HTTP)
 	http_init();
+	kore_accesslog_worker_init();
+#endif
 	kore_timer_init();
 	kore_connection_init();
 	kore_domain_load_crl();
+	kore_domain_keymgr_init();
 
 	quit = 0;
 	had_lock = 0;
 	next_lock = 0;
-	idle_check = 0;
+	worker_active_connections = 0;
+
 	kore_platform_event_init();
-	kore_accesslog_worker_init();
 	kore_msg_worker_init();
 
 #if defined(KORE_USE_PGSQL)
-	kore_pgsql_init();
+	kore_pgsql_sys_init();
 #endif
 
 #if defined(KORE_USE_TASKS)
 	kore_task_init();
 #endif
 
+#if !defined(KORE_NO_TLS)
+	last_seed = 0;
+	kore_msg_register(KORE_MSG_ENTROPY_RESP, worker_entropy_recv);
+#endif
+
+	if (nlisteners == 0)
+		worker_no_lock = 1;
+
 	kore_log(LOG_NOTICE, "worker %d started (cpu#%d)", kw->id, kw->cpu);
+
+	rcall = kore_runtime_getcall("kore_worker_configure");
+	if (rcall != NULL) {
+		kore_runtime_execute(rcall);
+		kore_free(rcall);
+	}
+
 	kore_module_onload();
 
 	for (;;) {
 		if (sig_recv != 0) {
-			if (sig_recv == SIGHUP)
+			switch (sig_recv) {
+			case SIGHUP:
 				kore_module_reload(1);
-			else if (sig_recv == SIGQUIT || sig_recv == SIGINT)
+				break;
+			case SIGQUIT:
+			case SIGINT:
+			case SIGTERM:
 				quit = 1;
+				break;
+			default:
+				break;
+			}
 
 			sig_recv = 0;
 		}
 
 		now = kore_time_ms();
 		netwait = kore_timer_run(now);
+		if (netwait > 100)
+			netwait = 100;
+
+#if !defined(KORE_NO_TLS)
+		if ((now - last_seed) > KORE_RESEED_TIME) {
+			kore_msg_send(KORE_WORKER_KEYMGR,
+			    KORE_MSG_ENTROPY_REQ, NULL, 0);
+			last_seed = now;
+		}
+#endif
 
 		if (now > next_lock) {
 			if (kore_worker_acceptlock_obtain()) {
@@ -330,21 +416,37 @@ kore_worker_entry(struct kore_worker *kw)
 			next_lock = now + WORKER_LOCK_TIMEOUT;
 		}
 
+#if !defined(KORE_NO_HTTP)
 		http_process();
+#endif
 
-		if ((now - idle_check) >= 10000) {
-			idle_check = now;
-			kore_connection_check_timeout();
-		}
-
+		kore_connection_check_timeout();
 		kore_connection_prune(KORE_CONNECTION_PRUNE_DISCONNECT);
 
-		if (quit && http_request_count == 0)
+		if (quit)
 			break;
 	}
 
-	kore_connection_prune(KORE_CONNECTION_PRUNE_ALL);
+	kore_platform_event_cleanup();
+	kore_connection_cleanup();
+	kore_domain_cleanup();
+	kore_module_cleanup();
+#if !defined(KORE_NO_HTTP)
+	http_cleanup();
+#endif
+	net_cleanup();
+
+#if defined(KORE_USE_PYTHON)
+	kore_python_cleanup();
+#endif
+
+#if defined(KORE_USE_PGSQL)
+	kore_pgsql_sys_cleanup();
+#endif
+
 	kore_debug("worker %d shutting down", kw->id);
+
+	kore_mem_cleanup();
 	exit(0);
 }
 
@@ -390,7 +492,20 @@ kore_worker_wait(int final)
 			    (kw->active_hdlr != NULL) ? kw->active_hdlr->func :
 			    "none");
 
-			if (kw->pid == accept_lock->current)
+#if !defined(KORE_NO_TLS)
+			if (id == KORE_WORKER_KEYMGR) {
+				kore_log(LOG_CRIT, "keymgr gone, stopping");
+				kw->pid = 0;
+				if (raise(SIGTERM) != 0) {
+					kore_log(LOG_WARNING,
+					    "failed to raise SIGTERM signal");
+				}
+				break;
+			}
+#endif
+
+			if (kw->pid == accept_lock->current &&
+			    worker_no_lock == 0)
 				worker_unlock();
 
 			if (kw->active_hdlr != NULL) {
@@ -418,7 +533,7 @@ kore_worker_wait(int final)
 static inline void
 kore_worker_acceptlock_release(void)
 {
-	if (worker_count == 1)
+	if (worker_count == 1 || worker_no_lock == 1)
 		return;
 
 	if (worker->has_lock != 1)
@@ -436,7 +551,7 @@ kore_worker_acceptlock_obtain(void)
 	if (worker->has_lock == 1)
 		return (1);
 
-	if (worker_count == 1) {
+	if (worker_count == 1 || worker_no_lock == 1) {
 		worker->has_lock = 1;
 		return (1);
 	}
@@ -473,3 +588,18 @@ worker_unlock(void)
 	if (!__sync_bool_compare_and_swap(&(accept_lock->lock), 1, 0))
 		kore_log(LOG_NOTICE, "worker_unlock(): wasnt locked");
 }
+
+#if !defined(KORE_NO_TLS)
+static void
+worker_entropy_recv(struct kore_msg *msg, const void *data)
+{
+	if (msg->length != 1024) {
+		kore_log(LOG_WARNING,
+		    "short entropy response (got:%u - wanted:1024)",
+		    msg->length);
+	}
+
+	RAND_poll();
+	RAND_seed(data, msg->length);
+}
+#endif

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -38,6 +38,16 @@ kore_connection_init(void)
 	    sizeof(struct connection), worker_max_connections);
 }
 
+void
+kore_connection_cleanup(void)
+{
+	kore_debug("connection_cleanup()");
+
+	/* Drop all connections */
+	kore_connection_prune(KORE_CONNECTION_PRUNE_ALL);
+	kore_pool_cleanup(&connection_pool);
+}
+
 struct connection *
 kore_connection_new(void *owner)
 {
@@ -45,56 +55,57 @@ kore_connection_new(void *owner)
 
 	c = kore_pool_get(&connection_pool);
 
+#if !defined(KORE_NO_TLS)
 	c->ssl = NULL;
+	c->cert = NULL;
+	c->tls_reneg = 0;
+#endif
 	c->flags = 0;
 	c->rnb = NULL;
 	c->snb = NULL;
-	c->cert = NULL;
-	c->wscbs = NULL;
 	c->owner = owner;
-	c->tls_reneg = 0;
+	c->handle = NULL;
 	c->disconnect = NULL;
 	c->hdlr_extra = NULL;
-	c->inflate_started = 0;
-	c->deflate_started = 0;
-	c->client_stream_id = 0;
 	c->proto = CONN_PROTO_UNKNOWN;
 	c->type = KORE_TYPE_CONNECTION;
-	c->wsize_initial = SPDY_INIT_WSIZE;
-	c->spdy_send_wsize = SPDY_INIT_WSIZE;
-	c->spdy_recv_wsize = SPDY_INIT_WSIZE;
 	c->idle_timer.start = 0;
 	c->idle_timer.length = KORE_IDLE_TIMER_MAX;
 
-	TAILQ_INIT(&(c->send_queue));
-	TAILQ_INIT(&(c->spdy_streams));
+#if !defined(KORE_NO_HTTP)
+	c->ws_connect = NULL;
+	c->ws_message = NULL;
+	c->ws_disconnect = NULL;
 	TAILQ_INIT(&(c->http_requests));
+#endif
+
+	TAILQ_INIT(&(c->send_queue));
 
 	return (c);
 }
 
 int
-kore_connection_accept(struct listener *l, struct connection **out)
+kore_connection_accept(struct listener *listener, struct connection **out)
 {
 	struct connection	*c;
-	struct sockaddr		*sin;
+	struct sockaddr		*s;
 	socklen_t		len;
 
-	kore_debug("kore_connection_accept(%p)", l);
+	kore_debug("kore_connection_accept(%p)", listener);
 
 	*out = NULL;
-	c = kore_connection_new(l);
+	c = kore_connection_new(listener);
 
-	c->addrtype = l->addrtype;
+	c->addrtype = listener->addrtype;
 	if (c->addrtype == AF_INET) {
 		len = sizeof(struct sockaddr_in);
-		sin = (struct sockaddr *)&(c->addr.ipv4);
+		s = (struct sockaddr *)&(c->addr.ipv4);
 	} else {
 		len = sizeof(struct sockaddr_in6);
-		sin = (struct sockaddr *)&(c->addr.ipv6);
+		s = (struct sockaddr *)&(c->addr.ipv6);
 	}
 
-	if ((c->fd = accept(l->fd, sin, &len)) == -1) {
+	if ((c->fd = accept(listener->fd, s, &len)) == -1) {
 		kore_pool_put(&connection_pool, c);
 		kore_debug("accept(): %s", errno_s);
 		return (KORE_RESULT_ERROR);
@@ -106,25 +117,33 @@ kore_connection_accept(struct listener *l, struct connection **out)
 		return (KORE_RESULT_ERROR);
 	}
 
+	c->handle = kore_connection_handle;
+	TAILQ_INSERT_TAIL(&connections, c, list);
+
 #if !defined(KORE_NO_TLS)
-	c->state = CONN_STATE_SSL_SHAKE;
-	c->write = net_write_ssl;
-	c->read = net_read_ssl;
+	c->state = CONN_STATE_TLS_SHAKE;
+	c->write = net_write_tls;
+	c->read = net_read_tls;
 #else
 	c->state = CONN_STATE_ESTABLISHED;
-	c->proto = CONN_PROTO_HTTP;
 	c->write = net_write;
 	c->read = net_read;
 
-	if (http_keepalive_time != 0)
-		c->idle_timer.length = http_keepalive_time * 1000;
-
-	net_recv_queue(c, http_header_max, NETBUF_CALL_CB_ALWAYS,
-	    http_header_recv);
+	if (listener->connect != NULL) {
+		kore_runtime_connect(listener->connect, c);
+	} else {
+#if !defined(KORE_NO_HTTP)
+		c->proto = CONN_PROTO_HTTP;
+		if (http_keepalive_time != 0)
+			c->idle_timer.length = http_keepalive_time * 1000;
+		net_recv_queue(c, http_header_max,
+		    NETBUF_CALL_CB_ALWAYS, http_header_recv);
+#endif
+	}
 #endif
 
-	TAILQ_INSERT_TAIL(&connections, c, list);
 	kore_connection_start_idletimer(c);
+	worker_active_connections++;
 
 	*out = c;
 	return (KORE_RESULT_OK);
@@ -139,11 +158,6 @@ kore_connection_check_timeout(void)
 	now = kore_time_ms();
 	TAILQ_FOREACH(c, &connections, list) {
 		if (c->proto == CONN_PROTO_MSG)
-			continue;
-		if (c->proto == CONN_PROTO_SPDY &&
-		    c->idle_timer.length == 0 &&
-		    !(c->flags & CONN_WRITE_BLOCK) &&
-		    !(c->flags & CONN_READ_BLOCK))
 			continue;
 		if (!(c->flags & CONN_IDLE_TIMER_ACT))
 			continue;
@@ -190,8 +204,7 @@ kore_connection_handle(struct connection *c)
 {
 #if !defined(KORE_NO_TLS)
 	int			r;
-	u_int32_t		len;
-	const u_char		*data;
+	struct listener		*listener;
 	char			cn[X509_CN_LENGTH];
 #endif
 
@@ -200,7 +213,7 @@ kore_connection_handle(struct connection *c)
 
 	switch (c->state) {
 #if !defined(KORE_NO_TLS)
-	case CONN_STATE_SSL_SHAKE:
+	case CONN_STATE_TLS_SHAKE:
 		if (c->ssl == NULL) {
 			c->ssl = SSL_new(primary_dom->ssl_ctx);
 			if (c->ssl == NULL) {
@@ -213,6 +226,7 @@ kore_connection_handle(struct connection *c)
 			SSL_set_app_data(c->ssl, c);
 		}
 
+		ERR_clear_error();
 		r = SSL_accept(c->ssl);
 		if (r <= 0) {
 			r = SSL_get_error(c->ssl, r);
@@ -239,6 +253,8 @@ kore_connection_handle(struct connection *c)
 				    "no CN found in client certificate");
 				return (KORE_RESULT_ERROR);
 			}
+		} else {
+			c->cert = NULL;
 		}
 
 		r = SSL_get_verify_result(c->ssl);
@@ -248,39 +264,24 @@ kore_connection_handle(struct connection *c)
 			return (KORE_RESULT_ERROR);
 		}
 
-		SSL_get0_next_proto_negotiated(c->ssl, &data, &len);
-		if (data) {
-			if (!memcmp(data, "spdy/3", MIN(6, len))) {
-				c->proto = CONN_PROTO_SPDY;
-				c->idle_timer.length = spdy_idle_time;
-				net_recv_queue(c, SPDY_FRAME_SIZE, 0,
-				    spdy_frame_recv);
-			} else if (!memcmp(data, "http/1.1", MIN(8, len))) {
-				c->proto = CONN_PROTO_HTTP;
-				if (http_keepalive_time != 0) {
-					c->idle_timer.length =
-					    http_keepalive_time * 1000;
-				}
-
-				net_recv_queue(c, http_header_max,
-				    NETBUF_CALL_CB_ALWAYS,
-				    http_header_recv);
-			} else {
-				kore_log(LOG_NOTICE,
-				    "npn: received unknown protocol");
-				return (KORE_RESULT_ERROR);
+		if (c->owner != NULL) {
+			listener = (struct listener *)c->owner;
+			if (listener->connect != NULL) {
+				kore_runtime_connect(listener->connect, c);
+				return (KORE_RESULT_OK);
 			}
-		} else {
-			c->proto = CONN_PROTO_HTTP;
-			if (http_keepalive_time != 0) {
-				c->idle_timer.length =
-				    http_keepalive_time * 1000;
-			}
-
-			net_recv_queue(c, http_header_max,
-			    NETBUF_CALL_CB_ALWAYS,
-			    http_header_recv);
 		}
+
+#if !defined(KORE_NO_HTTP)
+		c->proto = CONN_PROTO_HTTP;
+		if (http_keepalive_time != 0) {
+			c->idle_timer.length =
+			    http_keepalive_time * 1000;
+		}
+
+		net_recv_queue(c, http_header_max,
+		    NETBUF_CALL_CB_ALWAYS, http_header_recv);
+#endif
 
 		c->state = CONN_STATE_ESTABLISHED;
 		/* FALLTHROUGH */
@@ -312,8 +313,9 @@ void
 kore_connection_remove(struct connection *c)
 {
 	struct netbuf		*nb, *next;
-	struct spdy_stream	*s, *snext;
+#if !defined(KORE_NO_HTTP)
 	struct http_request	*req, *rnext;
+#endif
 
 	kore_debug("kore_connection_remove(%p)", c);
 
@@ -330,25 +332,28 @@ kore_connection_remove(struct connection *c)
 	close(c->fd);
 
 	if (c->hdlr_extra != NULL)
-		kore_mem_free(c->hdlr_extra);
+		kore_free(c->hdlr_extra);
 
-	if (c->inflate_started)
-		inflateEnd(&(c->z_inflate));
-	if (c->deflate_started)
-		deflateEnd(&(c->z_deflate));
-
-	for (req = TAILQ_FIRST(&(c->http_requests)); req != NULL; req = rnext) {
+#if !defined(KORE_NO_HTTP)
+	for (req = TAILQ_FIRST(&(c->http_requests));
+	    req != NULL; req = rnext) {
 		rnext = TAILQ_NEXT(req, olist);
 		TAILQ_REMOVE(&(c->http_requests), req, olist);
+		req->owner = NULL;
 		req->flags |= HTTP_REQUEST_DELETE;
 		http_request_wakeup(req);
 	}
+
+	kore_free(c->ws_connect);
+	kore_free(c->ws_message);
+	kore_free(c->ws_disconnect);
+#endif
 
 	for (nb = TAILQ_FIRST(&(c->send_queue)); nb != NULL; nb = next) {
 		next = TAILQ_NEXT(nb, list);
 		TAILQ_REMOVE(&(c->send_queue), nb, list);
 		if (!(nb->flags & NETBUF_IS_STREAM)) {
-			kore_mem_free(nb->buf);
+			kore_free(nb->buf);
 		} else if (nb->cb != NULL) {
 			(void)nb->cb(nb);
 		}
@@ -356,24 +361,12 @@ kore_connection_remove(struct connection *c)
 	}
 
 	if (c->rnb != NULL) {
-		kore_mem_free(c->rnb->buf);
+		kore_free(c->rnb->buf);
 		kore_pool_put(&nb_pool, c->rnb);
 	}
 
-	for (s = TAILQ_FIRST(&(c->spdy_streams)); s != NULL; s = snext) {
-		snext = TAILQ_NEXT(s, list);
-		TAILQ_REMOVE(&(c->spdy_streams), s, list);
-
-		if (s->hblock != NULL) {
-			if (s->hblock->header_block != NULL)
-				kore_mem_free(s->hblock->header_block);
-			kore_mem_free(s->hblock);
-		}
-
-		kore_mem_free(s);
-	}
-
 	kore_pool_put(&connection_pool, c);
+	worker_active_connections--;
 }
 
 void
@@ -384,10 +377,7 @@ kore_connection_check_idletimer(u_int64_t now, struct connection *c)
 	d = now - c->idle_timer.start;
 	if (d >= c->idle_timer.length) {
 		kore_debug("%p idle for %d ms, expiring", c, d);
-		if (c->proto == CONN_PROTO_SPDY)
-			spdy_session_teardown(c, SPDY_SESSION_ERROR_OK);
-		else
-			kore_connection_disconnect(c);
+		kore_connection_disconnect(c);
 	}
 }
 
@@ -428,9 +418,7 @@ kore_connection_nonblock(int fd, int nodelay)
 	}
 
 	if (nodelay) {
-		flags = 1;
-		if (setsockopt(fd, IPPROTO_TCP,
-		    TCP_NODELAY, (char *)&flags, sizeof(flags)) == -1) {
+		if (!kore_sockopt(fd, IPPROTO_TCP, TCP_NODELAY)) {
 			kore_log(LOG_NOTICE,
 			    "failed to set TCP_NODELAY on %d", fd);
 		}

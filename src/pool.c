@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,25 +14,37 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/mman.h>
 #include <sys/queue.h>
+
+#include <stdint.h>
 
 #include "kore.h"
 
 #define POOL_ELEMENT_BUSY		0
 #define POOL_ELEMENT_FREE		1
 
-static void		pool_region_create(struct kore_pool *, u_int32_t);
+#if defined(KORE_USE_TASKS)
+static void		pool_lock(struct kore_pool *);
+static void		pool_unlock(struct kore_pool *);
+#endif
+
+static void		pool_region_create(struct kore_pool *, size_t);
+static void		pool_region_destroy(struct kore_pool *);
 
 void
 kore_pool_init(struct kore_pool *pool, const char *name,
-    u_int32_t len, u_int32_t elm)
+    size_t len, size_t elm)
 {
-	kore_debug("kore_pool_init(%p, %s, %d, %d)", pool, name, len, elm);
+	kore_debug("kore_pool_init(%p, %s, %zu, %zu)", pool, name, len, elm);
 
+	if ((pool->name = strdup(name)) == NULL)
+		fatal("kore_pool_init: strdup %s", errno_s);
+
+	pool->lock = 0;
 	pool->elms = 0;
 	pool->inuse = 0;
 	pool->elen = len;
-	pool->name = kore_strdup(name);
 	pool->slen = pool->elen + sizeof(struct kore_pool_entry);
 
 	LIST_INIT(&(pool->regions));
@@ -41,16 +53,36 @@ kore_pool_init(struct kore_pool *pool, const char *name,
 	pool_region_create(pool, elm);
 }
 
+void
+kore_pool_cleanup(struct kore_pool *pool)
+{
+	pool->lock = 0;
+	pool->elms = 0;
+	pool->inuse = 0;
+	pool->elen = 0;
+	pool->slen = 0;
+
+	if (pool->name != NULL) {
+		free(pool->name);
+		pool->name = NULL;
+	}
+
+	pool_region_destroy(pool);
+}
+
 void *
 kore_pool_get(struct kore_pool *pool)
 {
 	u_int8_t			*ptr;
 	struct kore_pool_entry		*entry;
 
-	if (LIST_EMPTY(&(pool->freelist))) {
-		kore_log(LOG_NOTICE, "pool %s is exhausted (%d/%d)",
-		    pool->name, pool->inuse, pool->elms);
+#if defined(KORE_USE_TASKS)
+	pool_lock(pool);
+#endif
 
+	if (LIST_EMPTY(&(pool->freelist))) {
+		kore_log(LOG_NOTICE, "pool %s is exhausted (%zu/%zu)",
+		    pool->name, pool->inuse, pool->elms);
 		pool_region_create(pool, pool->elms);
 	}
 
@@ -64,8 +96,8 @@ kore_pool_get(struct kore_pool *pool)
 
 	pool->inuse++;
 
-#if defined(KORE_PEDANTIC_MALLOC)
-	explicit_bzero(ptr, pool->elen);
+#if defined(KORE_USE_TASKS)
+	pool_unlock(pool);
 #endif
 
 	return (ptr);
@@ -76,8 +108,8 @@ kore_pool_put(struct kore_pool *pool, void *ptr)
 {
 	struct kore_pool_entry		*entry;
 
-#if defined(KORE_PEDANTIC_MALLOC)
-	explicit_bzero(ptr, pool->elen);
+#if defined(KORE_USE_TASKS)
+	pool_lock(pool);
 #endif
 
 	entry = (struct kore_pool_entry *)
@@ -90,22 +122,36 @@ kore_pool_put(struct kore_pool *pool, void *ptr)
 	LIST_INSERT_HEAD(&(pool->freelist), entry, list);
 
 	pool->inuse--;
+
+#if defined(KORE_USE_TASKS)
+	pool_unlock(pool);
+#endif
 }
 
 static void
-pool_region_create(struct kore_pool *pool, u_int32_t elms)
+pool_region_create(struct kore_pool *pool, size_t elms)
 {
-	u_int32_t			i;
+	size_t				i;
 	u_int8_t			*p;
 	struct kore_pool_region		*reg;
 	struct kore_pool_entry		*entry;
 
-	kore_debug("pool_region_create(%p, %d)", pool, elms);
+	kore_debug("pool_region_create(%p, %zu)", pool, elms);
 
-	reg = kore_malloc(sizeof(struct kore_pool_region));
+	if ((reg = calloc(1, sizeof(struct kore_pool_region))) == NULL)
+		fatal("pool_region_create: calloc: %s", errno_s);
+
 	LIST_INSERT_HEAD(&(pool->regions), reg, list);
 
-	reg->start = kore_malloc(elms * pool->slen);
+	if (SIZE_MAX / elms < pool->slen)
+		fatal("pool_region_create: overflow");
+
+	reg->length = elms * pool->slen;
+	reg->start = mmap(NULL, reg->length, PROT_READ | PROT_WRITE,
+	    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (reg->start == NULL)
+		fatal("mmap: %s", errno_s);
+
 	p = (u_int8_t *)reg->start;
 
 	for (i = 0; i < elms; i++) {
@@ -119,3 +165,41 @@ pool_region_create(struct kore_pool *pool, u_int32_t elms)
 
 	pool->elms += elms;
 }
+
+static void
+pool_region_destroy(struct kore_pool *pool)
+{
+	struct kore_pool_region		*reg;
+
+	kore_debug("pool_region_destroy(%p)", pool);
+
+	/* Take care iterating when modifying list contents */
+	while (!LIST_EMPTY(&pool->regions)) {
+		reg = LIST_FIRST(&pool->regions);
+		LIST_REMOVE(reg, list);
+		(void)munmap(reg->start, reg->length);
+		free(reg);
+	}
+
+	/* Freelist references into the regions memory allocations */
+	LIST_INIT(&pool->freelist);
+	pool->elms = 0;
+}
+
+#if defined(KORE_USE_TASKS)
+static void
+pool_lock(struct kore_pool *pool)
+{
+	for (;;) {
+		if (__sync_bool_compare_and_swap(&pool->lock, 0, 1))
+			break;
+	}
+}
+
+static void
+pool_unlock(struct kore_pool *pool)
+{
+	if (!__sync_bool_compare_and_swap(&pool->lock, 1, 0))
+		fatal("pool_unlock: failed to release %s", pool->name);
+}
+#endif

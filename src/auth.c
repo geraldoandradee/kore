@@ -77,6 +77,7 @@ kore_auth_run(struct http_request *req, struct kore_auth *auth)
 
 	switch (r) {
 	case KORE_RESULT_OK:
+		req->flags |= HTTP_REQUEST_AUTHED;
 		kore_debug("kore_auth_run() for %s successful", req->path);
 		/* FALLTHROUGH */
 	case KORE_RESULT_RETRY:
@@ -109,13 +110,15 @@ kore_auth_cookie(struct http_request *req, struct kore_auth *auth)
 	size_t		len, slen;
 	char		*value, *c, *cookie, *cookies[HTTP_MAX_COOKIES];
 
-	if (!http_request_header(req, "cookie", &cookie))
+	if (!http_request_header(req, "cookie", &c))
 		return (KORE_RESULT_ERROR);
+
+	cookie = kore_strdup(c);
 
 	slen = strlen(auth->value);
 	v = kore_split_string(cookie, ";", cookies, HTTP_MAX_COOKIES);
 	for (i = 0; i < v; i++) {
-		for (c = cookies[i]; isspace(*c); c++)
+		for (c = cookies[i]; isspace(*(unsigned char *)c); c++)
 			;
 
 		len = MIN(slen, strlen(cookies[i]));
@@ -124,18 +127,18 @@ kore_auth_cookie(struct http_request *req, struct kore_auth *auth)
 	}
 
 	if (i == v) {
-		kore_mem_free(cookie);
+		kore_free(cookie);
 		return (KORE_RESULT_ERROR);
 	}
 
 	c = cookies[i];
 	if ((value = strchr(c, '=')) == NULL) {
-		kore_mem_free(cookie);
+		kore_free(cookie);
 		return (KORE_RESULT_ERROR);
 	}
 
 	i = kore_validator_check(req, auth->validator, ++value);
-	kore_mem_free(cookie);
+	kore_free(cookie);
 
 	return (i);
 }
@@ -143,22 +146,24 @@ kore_auth_cookie(struct http_request *req, struct kore_auth *auth)
 static int
 kore_auth_header(struct http_request *req, struct kore_auth *auth)
 {
-	int		r;
 	char		*header;
 
 	if (!http_request_header(req, auth->value, &header))
 		return (KORE_RESULT_ERROR);
 
-	r = kore_validator_check(req, auth->validator, header);
-	kore_mem_free(header);
-
-	return (r);
+	return (kore_validator_check(req, auth->validator, header));
 }
 
 static int
 kore_auth_request(struct http_request *req, struct kore_auth *auth)
 {
-	return (kore_validator_check(req, auth->validator, req));
+	int		ret;
+
+	req->flags |= HTTP_VALIDATOR_IS_REQUEST;
+	ret = kore_validator_check(req, auth->validator, req);
+	req->flags &= ~HTTP_VALIDATOR_IS_REQUEST;
+
+	return (ret);
 }
 
 struct kore_auth *

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 
 #include <poll.h>
+#include <time.h>
 
 #include "kore.h"
 #include "http.h"
@@ -32,7 +33,9 @@ struct kore_log_packet {
 	char		host[KORE_DOMAINNAME_LEN];
 	char		path[HTTP_URI_LEN];
 	char		agent[HTTP_USERAGENT_LEN];
+#if !defined(KORE_NO_TLS)
 	char		cn[X509_CN_LENGTH];
+#endif
 };
 
 void
@@ -90,14 +93,15 @@ kore_accesslog_write(const void *data, u_int32_t len)
 		break;
 	}
 
+	cn = "none";
+#if !defined(KORE_NO_TLS)
 	if (logpacket.cn[0] != '\0')
 		cn = logpacket.cn;
-	else
-		cn = "none";
+#endif
 
 	if (inet_ntop(logpacket.addrtype, &(logpacket.addr),
 	    addr, sizeof(addr)) == NULL)
-		kore_strlcpy(addr, "unknown", sizeof(addr));
+		(void)kore_strlcpy(addr, "unknown", sizeof(addr));
 
 	time(&now);
 	tbuf = kore_time_to_date(now);
@@ -146,19 +150,26 @@ kore_accesslog(struct http_request *req)
 	logpacket.worker_id = worker->id;
 	logpacket.worker_cpu = worker->cpu;
 	logpacket.time_req = req->total;
-	kore_strlcpy(logpacket.host, req->host, sizeof(logpacket.host));
-	kore_strlcpy(logpacket.path, req->path, sizeof(logpacket.path));
+
+	if (kore_strlcpy(logpacket.host,
+	    req->host, sizeof(logpacket.host)) >= sizeof(logpacket.host))
+		kore_log(LOG_NOTICE, "kore_accesslog: host truncated");
+
+	if (kore_strlcpy(logpacket.path,
+	    req->path, sizeof(logpacket.path)) >= sizeof(logpacket.path))
+		kore_log(LOG_NOTICE, "kore_accesslog: path truncated");
 
 	if (req->agent != NULL) {
-		kore_strlcpy(logpacket.agent,
-		    req->agent, sizeof(logpacket.agent));
+		if (kore_strlcpy(logpacket.agent, req->agent,
+		    sizeof(logpacket.agent)) >= sizeof(logpacket.agent))
+			kore_log(LOG_NOTICE, "kore_accesslog: agent truncated");
 	} else {
-		kore_strlcpy(logpacket.agent, "unknown",
+		(void)kore_strlcpy(logpacket.agent, "unknown",
 		    sizeof(logpacket.agent));
 	}
 
-	memset(logpacket.cn, '\0', sizeof(logpacket.cn));
 #if !defined(KORE_NO_TLS)
+	memset(logpacket.cn, '\0', sizeof(logpacket.cn));
 	if (req->owner->cert != NULL) {
 		if (X509_GET_CN(req->owner->cert,
 		    logpacket.cn, sizeof(logpacket.cn)) == -1) {

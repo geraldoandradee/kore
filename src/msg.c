@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -34,8 +34,12 @@ static int		msg_recv_packet(struct netbuf *);
 static int		msg_recv_data(struct netbuf *);
 static void		msg_disconnected_parent(struct connection *);
 static void		msg_disconnected_worker(struct connection *);
+static void		msg_type_shutdown(struct kore_msg *msg, const void *data);
+
+#if !defined(KORE_NO_HTTP)
 static void		msg_type_accesslog(struct kore_msg *, const void *);
 static void		msg_type_websocket(struct kore_msg *, const void *);
+#endif
 
 void
 kore_msg_init(void)
@@ -54,7 +58,11 @@ kore_msg_parent_init(void)
 		kore_msg_parent_add(kw);
 	}
 
+	kore_msg_register(KORE_MSG_SHUTDOWN, msg_type_shutdown);
+
+#if !defined(KORE_NO_HTTP)
 	kore_msg_register(KORE_MSG_ACCESSLOG, msg_type_accesslog);
+#endif
 }
 
 void
@@ -68,6 +76,7 @@ kore_msg_parent_add(struct kore_worker *kw)
 	kw->msg[0]->state = CONN_STATE_ESTABLISHED;
 	kw->msg[0]->hdlr_extra = &kw->id;
 	kw->msg[0]->disconnect = msg_disconnected_worker;
+	kw->msg[0]->handle = kore_connection_handle;
 
 	TAILQ_INSERT_TAIL(&connections, kw->msg[0], list);
 	kore_platform_event_all(kw->msg[0]->fd, kw->msg[0]);
@@ -86,7 +95,9 @@ kore_msg_parent_remove(struct kore_worker *kw)
 void
 kore_msg_worker_init(void)
 {
+#if !defined(KORE_NO_HTTP)
 	kore_msg_register(KORE_MSG_WEBSOCKET, msg_type_websocket);
+#endif
 
 	worker->msg[1] = kore_connection_new(NULL);
 	worker->msg[1]->fd = worker->pipe[1];
@@ -95,6 +106,7 @@ kore_msg_worker_init(void)
 	worker->msg[1]->proto = CONN_PROTO_MSG;
 	worker->msg[1]->state = CONN_STATE_ESTABLISHED;
 	worker->msg[1]->disconnect = msg_disconnected_parent;
+	worker->msg[1]->handle = kore_connection_handle;
 
 	TAILQ_INSERT_TAIL(&connections, worker->msg[1], list);
 	kore_platform_event_all(worker->msg[1]->fd, worker->msg[1]);
@@ -120,7 +132,7 @@ kore_msg_register(u_int8_t id, void (*cb)(struct kore_msg *, const void *))
 }
 
 void
-kore_msg_send(u_int16_t dst, u_int8_t id, void *data, u_int32_t len)
+kore_msg_send(u_int16_t dst, u_int8_t id, const void *data, u_int32_t len)
 {
 	struct kore_msg		m;
 
@@ -129,8 +141,10 @@ kore_msg_send(u_int16_t dst, u_int8_t id, void *data, u_int32_t len)
 	m.length = len;
 	m.src = worker->id;
 
-	net_send_queue(worker->msg[1], &m, sizeof(m), NULL, NETBUF_LAST_CHAIN);
-	net_send_queue(worker->msg[1], data, len, NULL, NETBUF_LAST_CHAIN);
+	net_send_queue(worker->msg[1], &m, sizeof(m));
+	if (data != NULL && len > 0)
+		net_send_queue(worker->msg[1], data, len);
+
 	net_send_flush(worker->msg[1]);
 }
 
@@ -139,8 +153,12 @@ msg_recv_packet(struct netbuf *nb)
 {
 	struct kore_msg		*msg = (struct kore_msg *)nb->buf;
 
-	net_recv_expand(nb->owner, msg->length, msg_recv_data);
-	return (KORE_RESULT_OK);
+	if (msg->length > 0) {
+		net_recv_expand(nb->owner, msg->length, msg_recv_data);
+		return (KORE_RESULT_OK);
+	}
+
+	return (msg_recv_data(nb));
 }
 
 static int
@@ -157,7 +175,10 @@ msg_recv_data(struct netbuf *nb)
 		if (worker != NULL && msg->dst != worker->id)
 			fatal("received message for incorrect worker");
 
-		type->cb(msg, nb->buf + sizeof(*msg));
+		if (msg->length > 0)
+			type->cb(msg, nb->buf + sizeof(*msg));
+		else
+			type->cb(msg, NULL);
 	}
 
 	if (worker == NULL && type == NULL) {
@@ -175,8 +196,7 @@ msg_recv_data(struct netbuf *nb)
 			/* This allows the worker to receive the correct id. */
 			msg->dst = *(u_int8_t *)c->hdlr_extra;
 
-			net_send_queue(c, nb->buf, nb->s_off,
-			    NULL, NETBUF_LAST_CHAIN);
+			net_send_queue(c, nb->buf, nb->s_off);
 			net_send_flush(c);
 		}
 	}
@@ -200,6 +220,14 @@ msg_disconnected_worker(struct connection *c)
 }
 
 static void
+msg_type_shutdown(struct kore_msg *msg, const void *data)
+{
+	kore_log(LOG_NOTICE, "worker requested shutdown");
+	kore_signal(SIGQUIT);
+}
+
+#if !defined(KORE_NO_HTTP)
+static void
 msg_type_accesslog(struct kore_msg *msg, const void *data)
 {
 	if (kore_accesslog_write(data, msg->length) == -1)
@@ -213,12 +241,12 @@ msg_type_websocket(struct kore_msg *msg, const void *data)
 
 	TAILQ_FOREACH(c, &connections, list) {
 		if (c->proto == CONN_PROTO_WEBSOCKET) {
-			net_send_queue(c, data, msg->length,
-			    NULL, NETBUF_LAST_CHAIN);
+			net_send_queue(c, data, msg->length);
 			net_send_flush(c);
 		}
 	}
 }
+#endif
 
 static struct msg_type *
 msg_type_lookup(u_int8_t id)

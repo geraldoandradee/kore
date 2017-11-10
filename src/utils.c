@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,6 +16,12 @@
 
 #include <sys/time.h>
 
+#include <ctype.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
 #include <limits.h>
 
 #include "kore.h"
@@ -57,25 +63,37 @@ kore_debug_internal(char *file, int line, const char *fmt, ...)
 void
 kore_log_init(void)
 {
+#if defined(KORE_SINGLE_BINARY)
+	extern const char	*__progname;
+	const char		*name = __progname;
+#else
+	const char		*name = "kore";
+#endif
+
 	if (!foreground)
-		openlog("kore", LOG_NDELAY | LOG_PID, LOG_DAEMON);
+		openlog(name, LOG_NDELAY | LOG_PID, LOG_DAEMON);
 }
 
 void
 kore_log(int prio, const char *fmt, ...)
 {
 	va_list		args;
-	char		buf[2048];
+	char		buf[2048], tmp[32];
 
 	va_start(args, fmt);
 	(void)vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 
 	if (worker != NULL) {
+		(void)snprintf(tmp, sizeof(tmp), "wrk %d", worker->id);
+#if !defined(KORE_NO_TLS)
+		if (worker->id == KORE_WORKER_KEYMGR)
+			(void)kore_strlcpy(tmp, "keymgr", sizeof(tmp));
+#endif
 		if (foreground)
-			printf("[wrk %d]: %s\n", worker->id, buf);
+			printf("[%s]: %s\n", tmp, buf);
 		else
-			syslog(prio, "[wrk %d]: %s", worker->id, buf);
+			syslog(prio, "[%s]: %s", tmp, buf);
 	} else {
 		if (foreground)
 			printf("[parent]: %s\n", buf);
@@ -84,12 +102,15 @@ kore_log(int prio, const char *fmt, ...)
 	}
 }
 
-void
-kore_strlcpy(char *dst, const char *src, size_t len)
+size_t
+kore_strlcpy(char *dst, const char *src, const size_t len)
 {
 	char		*d = dst;
 	const char	*s = src;
 	const char	*end = dst + len - 1;
+
+	if (len == 0)
+		fatal("kore_strlcpy: len == 0");
 
 	while ((*d = *s) != '\0') {
 		if (d == end) {
@@ -100,6 +121,11 @@ kore_strlcpy(char *dst, const char *src, size_t len)
 		d++;
 		s++;
 	}
+
+	while (*s != '\0')
+		s++;
+
+	return (s - src);
 }
 
 int
@@ -198,10 +224,13 @@ kore_strtonum64(const char *str, int sign, int *err)
 }
 
 int
-kore_split_string(char *input, char *delim, char **out, size_t ele)
+kore_split_string(char *input, const char *delim, char **out, size_t ele)
 {
 	int		count;
 	char		**ap;
+
+	if (ele == 0)
+		return (0);
 
 	count = 0;
 	for (ap = out; ap < &out[ele - 1] &&
@@ -217,7 +246,7 @@ kore_split_string(char *input, char *delim, char **out, size_t ele)
 }
 
 void
-kore_strip_chars(char *in, char strip, char **out)
+kore_strip_chars(char *in, const char strip, char **out)
 {
 	u_int32_t	len;
 	char		*s, *p;
@@ -312,7 +341,7 @@ kore_date_to_time(char *http_date)
 	}
 
 out:
-	kore_mem_free(sdup);
+	kore_free(sdup);
 	return (t);
 }
 
@@ -348,68 +377,74 @@ kore_time_ms(void)
 }
 
 int
-kore_base64_encode(u_int8_t *data, u_int32_t len, char **out)
+kore_base64_encode(const void *data, size_t len, char **out)
 {
-	struct kore_buf		*res;
-	u_int8_t		n, *pdata;
-	int			i, padding;
-	u_int32_t		idx, b, plen;
+	u_int8_t		n;
+	size_t			nb;
+	const u_int8_t		*ptr;
+	u_int32_t		bytes;
+	struct kore_buf		result;
 
-	if ((len % 3) != 0) {
-		padding = 3 - (len % 3);
-		plen = len + padding;
-		pdata = kore_malloc(plen);
+	nb = 0;
+	ptr = data;
+	kore_buf_init(&result, (len / 3) * 4);
 
-		memcpy(pdata, data, len);
-		memset(pdata + len, 0, padding);
-	} else {
-		plen = len;
-		padding = 0;
-		pdata = data;
-	}
-
-	res = kore_buf_create(plen);
-
-	i = 2;
-	b = 0;
-	for (idx = 0; idx < plen; idx++) {
-		b |= (pdata[idx] << (i * 8));
-		if (i-- == 0) {
-			for (i = 3; i >= 0; i--) {
-				n = (b >> (6 * i)) & 0x3f;
-				if (n >= sizeof(b64table)) {
-					kore_debug("unable to encode %d", n);
-					kore_buf_free(res);
-					return (KORE_RESULT_ERROR);
-				}
-
-				if (idx >= len && i < padding)
-					break;
-
-				kore_buf_append(res, &(b64table[n]), 1);
-			}
-
-			b = 0;
-			i = 2;
+	while (len > 0) {
+		if (len > 2) {
+			nb = 3;
+			bytes = *ptr++ << 16;
+			bytes |= *ptr++ << 8;
+			bytes |= *ptr++;
+		} else if (len > 1) {
+			nb = 2;
+			bytes = *ptr++ << 16;
+			bytes |= *ptr++ << 8;
+		} else if (len == 1) {
+			nb = 1;
+			bytes = *ptr++ << 16;
+		} else {
+			kore_buf_cleanup(&result);
+			return (KORE_RESULT_ERROR);
 		}
+
+		n = (bytes >> 18) & 0x3f;
+		kore_buf_append(&result, &(b64table[n]), 1);
+		n = (bytes >> 12) & 0x3f;
+		kore_buf_append(&result, &(b64table[n]), 1);
+		if (nb > 1) {
+			n = (bytes >> 6) & 0x3f;
+			kore_buf_append(&result, &(b64table[n]), 1);
+			if (nb > 2) {
+				n = bytes & 0x3f;
+				kore_buf_append(&result, &(b64table[n]), 1);
+			}
+		}
+
+		len -= nb;
 	}
 
-	for (i = 0; i < padding; i++)
-		kore_buf_append(res, (u_int8_t *)"=", 1);
+	switch (nb) {
+	case 1:
+		kore_buf_appendf(&result, "==");
+		break;
+	case 2:
+		kore_buf_appendf(&result, "=");
+		break;
+	case 3:
+		break;
+	default:
+		kore_buf_cleanup(&result);
+		return (KORE_RESULT_ERROR);
+	}
 
-	if (pdata != data)
-		kore_mem_free(pdata);
-
-	pdata = kore_buf_release(res, &plen);
-	*out = kore_malloc(plen + 1);
-	kore_strlcpy(*out, (char *)pdata, plen + 1);
-	kore_mem_free(pdata);
+	/* result.data gets taken over so no need to cleanup result. */
+	*out = kore_buf_stringify(&result, NULL);
 
 	return (KORE_RESULT_OK);
 }
 
 int
-kore_base64_decode(char *in, u_int8_t **out, u_int32_t *olen)
+kore_base64_decode(char *in, u_int8_t **out, size_t *olen)
 {
 	int			i, c;
 	struct kore_buf		*res;
@@ -421,7 +456,7 @@ kore_base64_decode(char *in, u_int8_t **out, u_int32_t *olen)
 	d = 0;
 	c = 0;
 	len = strlen(in);
-	res = kore_buf_create(len);
+	res = kore_buf_alloc(len);
 
 	for (idx = 0; idx < len; idx++) {
 		c = in[idx];
@@ -473,30 +508,75 @@ kore_base64_decode(char *in, u_int8_t **out, u_int32_t *olen)
 }
 
 void *
-kore_mem_find(void *src, size_t slen, void *needle, u_int32_t len)
+kore_mem_find(void *src, size_t slen, void *needle, size_t len)
 {
-	u_int8_t	*p, *end;
+	size_t		pos;
 
-	end = (u_int8_t *)src + slen;
-	for (p = src; p < end; p++) {
-		if (*p != *(u_int8_t *)needle)
+	for (pos = 0; pos < slen; pos++) {
+		if ( *((u_int8_t *)src + pos) != *(u_int8_t *)needle)
 			continue;
 
-		if ((end - p) < len)
+		if ((slen - pos) < len)
 			return (NULL);
 
-		if (!memcmp(p, needle, len))
-			return (p);
+		if (!memcmp((u_int8_t *)src + pos, needle, len))
+			return ((u_int8_t *)src + pos);
 	}
 
 	return (NULL);
 }
 
+char *
+kore_text_trim(char *string, size_t len)
+{
+	char		*end;
+
+	if (len == 0)
+		return (string);
+
+	end = (string + len) - 1;
+	while (isspace(*(unsigned char *)string) && string < end)
+		string++;
+
+	while (isspace(*(unsigned char *)end) && end > string)
+		*(end)-- = '\0';
+
+	return (string);
+}
+
+char *
+kore_read_line(FILE *fp, char *in, size_t len)
+{
+	char	*p, *t;
+
+	if (fgets(in, len, fp) == NULL)
+		return (NULL);
+
+	p = in;
+	in[strcspn(in, "\n")] = '\0';
+
+	while (isspace(*(unsigned char *)p))
+		p++;
+
+	if (p[0] == '#' || p[0] == '\0') {
+		p[0] = '\0';
+		return (p);
+	}
+
+	for (t = p; *t != '\0'; t++) {
+		if (*t == '\t')
+			*t = ' ';
+	}
+
+	return (p);
+}
+
 void
 fatal(const char *fmt, ...)
 {
-	va_list		args;
-	char		buf[2048];
+	va_list			args;
+	char			buf[2048];
+	extern const char	*__progname;
 
 	va_start(args, fmt);
 	(void)vsnprintf(buf, sizeof(buf), fmt, args);
@@ -505,6 +585,11 @@ fatal(const char *fmt, ...)
 	if (!foreground)
 		kore_log(LOG_ERR, "%s", buf);
 
-	printf("kore: %s\n", buf);
+#if !defined(KORE_NO_TLS)
+	if (worker != NULL && worker->id == KORE_WORKER_KEYMGR)
+		kore_keymgr_cleanup();
+#endif
+
+	printf("%s: %s\n", __progname, buf);
 	exit(1);
 }

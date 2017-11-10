@@ -93,8 +93,8 @@ video_stream(struct http_request *req)
 		return (KORE_RESULT_OK);
 	}
 
-	kore_log(LOG_NOTICE, "%p: opened %s (%s) for streaming (%ld ref:%d)",
-	    req->owner, v->path, ctype, v->size, v->ref);
+	kore_log(LOG_NOTICE, "%p: opened %s (%s) for streaming (%lld ref:%d)",
+	    (void *)req->owner, v->path, ctype, v->size, v->ref);
 
 	if (http_request_header(req, "range", &header)) {
 		if ((bytes = strchr(header, '=')) == NULL) {
@@ -104,7 +104,7 @@ video_stream(struct http_request *req)
 		}
 
 		bytes++;
-		n = kore_split_string(bytes, "-", range, 2);
+		n = kore_split_string(bytes, "-", range, 3);
 		if (n == 0) {
 			v->ref--;
 			http_response(req, 416, NULL, 0);
@@ -148,8 +148,8 @@ video_stream(struct http_request *req)
 			return (KORE_RESULT_OK);
 		}
 
-		kore_log(LOG_NOTICE, "%p: %s sending: %ld-%ld/%ld",
-		    req->owner, v->path, start, end - 1, v->size);
+		kore_log(LOG_NOTICE, "%p: %s sending: %lld-%lld/%lld",
+		    (void *)req->owner, v->path, start, end - 1, v->size);
 		http_response_header(req, "content-range", rb);
 	} else {
 		start = 0;
@@ -186,8 +186,8 @@ video_open(struct http_request *req, struct video **out)
 
 			close(v->fd);
 			TAILQ_REMOVE(&videos, v, list);
-			kore_mem_free(v->path);
-			kore_mem_free(v);
+			kore_free(v->path);
+			kore_free(v);
 
 			http_response(req, 500, NULL, 0);
 			return (KORE_RESULT_ERROR);
@@ -201,8 +201,8 @@ video_open(struct http_request *req, struct video **out)
 	v->path = kore_strdup(fpath);
 
 	if ((v->fd = open(fpath, O_RDONLY)) == -1) {
-		kore_mem_free(v->path);
-		kore_mem_free(v);
+		kore_free(v->path);
+		kore_free(v);
 
 		if (errno == ENOENT)
 			http_response(req, 404, NULL, 0);
@@ -214,8 +214,8 @@ video_open(struct http_request *req, struct video **out)
 
 	if (fstat(v->fd, &st) == -1) {
 		close(v->fd);
-		kore_mem_free(v->path);
-		kore_mem_free(v);
+		kore_free(v->path);
+		kore_free(v);
 
 		http_response(req, 500, NULL, 0);
 		return (KORE_RESULT_ERROR);
@@ -224,8 +224,8 @@ video_open(struct http_request *req, struct video **out)
 	v->size = st.st_size;
 	if (!video_mmap(req, v)) {
 		close(v->fd);
-		kore_mem_free(v->path);
-		kore_mem_free(v);
+		kore_free(v->path);
+		kore_free(v);
 
 		http_response(req, 500, NULL, 0);
 		return (KORE_RESULT_ERROR);
@@ -261,8 +261,8 @@ video_stream_finish(struct netbuf *nb)
 	struct video	*v = nb->extra;
 
 	v->ref--;
-	kore_log(LOG_NOTICE, "%p: video stream %s done (%d/%d ref:%d)",
-	    nb->owner, v->path, nb->s_off, nb->b_len, v->ref);
+	kore_log(LOG_NOTICE, "%p: video stream %s done (%zu/%zu ref:%d)",
+	    (void *)nb->owner, v->path, nb->s_off, nb->b_len, v->ref);
 
 	if (v->ref == 0)
 		video_unmap(v);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2015 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2016 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -35,15 +35,16 @@ kore_validator_add(const char *name, u_int8_t type, const char *arg)
 	switch (val->type) {
 	case KORE_VALIDATOR_TYPE_REGEX:
 		if (regcomp(&(val->rctx), arg, REG_EXTENDED | REG_NOSUB)) {
-			kore_mem_free(val);
+			kore_free(val);
 			kore_log(LOG_NOTICE,
 			    "validator %s has bad regex %s", name, arg);
 			return (KORE_RESULT_ERROR);
 		}
 		break;
 	case KORE_VALIDATOR_TYPE_FUNCTION:
-		if ((val->func = kore_module_getsym(arg)) == NULL) {
-			kore_mem_free(val);
+		val->rcall = kore_runtime_getcall(arg);
+		if (val->rcall == NULL) {
+			kore_free(val);
 			kore_log(LOG_NOTICE,
 			    "validator %s has undefined callback %s",
 			    name, arg);
@@ -51,7 +52,7 @@ kore_validator_add(const char *name, u_int8_t type, const char *arg)
 		}
 		break;
 	default:
-		kore_mem_free(val);
+		kore_free(val);
 		return (KORE_RESULT_ERROR);
 	}
 
@@ -91,7 +92,7 @@ kore_validator_check(struct http_request *req, struct kore_validator *val,
 			r = KORE_RESULT_ERROR;
 		break;
 	case KORE_VALIDATOR_TYPE_FUNCTION:
-		r = val->func(req, data);
+		r = kore_runtime_validator(val->rcall, req, data);
 		break;
 	default:
 		r = KORE_RESULT_ERROR;
@@ -112,8 +113,10 @@ kore_validator_reload(void)
 		if (val->type != KORE_VALIDATOR_TYPE_FUNCTION)
 			continue;
 
-		if ((val->func = kore_module_getsym(val->arg)) == NULL)
-			fatal("no function for validator %s found", val->name);
+		kore_free(val->rcall);
+		val->rcall = kore_runtime_getcall(val->arg);
+		if (val->rcall == NULL)
+			fatal("no function for validator %s found", val->arg);
 	}
 }
 

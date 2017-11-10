@@ -1,7 +1,11 @@
 kore
 *.o
 *.swp
+*.swo
 *.module
 *.DSYM
 cert
+<<<<<<< HEAD
 .idea
+obj
+.lvimrc

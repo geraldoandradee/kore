@@ -42,16 +42,16 @@ open_connection(struct http_request *req)
 {
 	char			*host, *port;
 
-	/* Don't want to deal with SPDY connections. */
+	/* Make sure its HTTP. */
 	if (req->owner->proto != CONN_PROTO_HTTP) {
 		http_response(req, HTTP_STATUS_BAD_REQUEST, NULL, 0);
 		return (KORE_RESULT_OK);
 	}
 
 	/* Parse the query string and grab our arguments. */
-	http_populate_arguments(req);
-	if (!http_argument_get_string("host", &host, NULL) ||
-	    !http_argument_get_string("port", &port, NULL)) {
+	http_populate_get(req);
+	if (!http_argument_get_string(req, "host", &host) ||
+	    !http_argument_get_string(req, "port", &port)) {
 		http_response(req, HTTP_STATUS_BAD_REQUEST, NULL, 0);
 		return (KORE_RESULT_OK);
 	}
@@ -161,9 +161,9 @@ ktunnel_pipe_data(struct netbuf *nb)
 	struct connection	*src = nb->owner;
 	struct connection	*dst = src->hdlr_extra;
 
-	printf("received %d bytes on pipe %p (-> %p)\n", nb->s_off, src, dst);
+	printf("received %zu bytes on pipe %p (-> %p)\n", nb->s_off, src, dst);
 
-	net_send_queue(dst, nb->buf, nb->s_off, NULL, NETBUF_LAST_CHAIN);
+	net_send_queue(dst, nb->buf, nb->s_off);
 	net_send_flush(dst);
 	net_recv_reset(src, NETBUF_SEND_PAYLOAD_MAX, ktunnel_pipe_data);
 
@@ -181,7 +181,7 @@ ktunnel_pipe_disconnect(struct connection *c)
 	printf("ktunnel_pipe_disconnect(%p)->%p\n", c, cpipe);
 
 	if (cpipe != NULL) {
-		/* Prevent Kore from calling kore_mem_free() on hdlr_extra. */
+		/* Prevent Kore from calling kore_free() on hdlr_extra. */
 		c->hdlr_extra = NULL;
 		kore_connection_disconnect(cpipe);
 	}
